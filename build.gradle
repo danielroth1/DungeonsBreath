@@ -1,0 +1,53 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(23)
+    }
+    modularity.inferModulePath = true
+}
+
+repositories {
+    mavenCentral()
+}
+
+
+// Use a JavaFX release compatible with JDK 23
+def javafxVersion = '23.0.2'
+
+// Detect platform for JavaFX native artifacts (win, mac, linux)
+def osName = System.getProperty('os.name').toLowerCase()
+def platformClassifier = {
+    if (osName.contains('win')) return 'win'
+    if (osName.contains('mac')) return 'mac'
+    return 'linux'
+}()
+
+dependencies {
+    // Use platform-specific classifiers so modules are available on the module path
+    implementation "org.openjfx:javafx-base:${javafxVersion}:${platformClassifier}"
+    implementation "org.openjfx:javafx-graphics:${javafxVersion}:${platformClassifier}"
+    implementation "org.openjfx:javafx-controls:${javafxVersion}:${platformClassifier}"
+    implementation "org.openjfx:javafx-fxml:${javafxVersion}:${platformClassifier}"
+    implementation "org.openjfx:javafx-media:${javafxVersion}:${platformClassifier}"
+}
+
+application {
+    // Main class is modularized; use the module/mainClass syntax
+    mainModule = 'com.game.dungeons_breath'
+    mainClass = 'com.game.dungeons_breath.MainApplication'
+}
+
+// Ensure JavaFX modules are on module path when running
+run {
+    jvmArgs = [
+        '--add-modules', 'javafx.controls,javafx.fxml,javafx.media'
+    ]
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}

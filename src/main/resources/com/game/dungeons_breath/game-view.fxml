@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import com.game.dungeons_breath.*?>
+<?import javafx.geometry.*?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+
+<VBox alignment="CENTER"
+    onKeyPressed="#onKeyPressed"
+    onKeyReleased="#onKeyReleased"
+    style="-fx-background-color: grey;"
+    xmlns="http://javafx.com/javafx/17.0.12"
+    xmlns:fx="http://javafx.com/fxml/1"
+    fx:controller="com.game.dungeons_breath.GameViewController">
+    <VBox fx:id="canvasParent"
+        alignment="CENTER"
+        style="-fx-background-color: yellow;"
+        VBox.vgrow="ALWAYS">
+        <CanvasPane fx:id="canvasPane"
+            onMousePressed="#onMousePressed"
+            onMouseReleased="#onMouseReleased"
+            style="-fx-background-color: brown;"
+            VBox.vgrow="ALWAYS" />
+    </VBox>
+    <HBox alignment="CENTER">
+        <Button onAction="#onBackButtonClick" prefWidth="80.0" text="Back">
+            <HBox.margin>
+                <Insets right="5.0" />
+            </HBox.margin>
+        </Button>
+        <Button onAction="#onRestartButtonClick" prefWidth="80.0" text="Restart">
+            <HBox.margin>
+                <Insets left="5.0" />
+            </HBox.margin>
+        </Button>
+    </HBox>
+</VBox>
