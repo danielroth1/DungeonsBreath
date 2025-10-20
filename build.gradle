@@ -5,7 +5,7 @@ plugins {
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(23)
+        languageVersion = JavaLanguageVersion.of(21)
     }
     modularity.inferModulePath = true
 }
@@ -15,8 +15,8 @@ repositories {
 }
 
 
-// Use a JavaFX release compatible with JDK 23
-def javafxVersion = '23.0.2'
+// Use a JavaFX release compatible with JDK 21
+def javafxVersion = '21.0.8'
 
 // Detect platform for JavaFX native artifacts (win, mac, linux)
 def osName = System.getProperty('os.name').toLowerCase()
@@ -51,3 +51,465 @@ run {
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
 }
+
+
+// ------------------------------------------------------------------
+// jpackage / jlink tasks for creating native installers and app-images
+// Adapted for a modular project (module-info.java present) and Java 21
+// ------------------------------------------------------------------
+
+// Helper: resolve application main module/class safely
+def resolveApplicationValue(prop) {
+    try {
+        return prop.get()
+    } catch (Exception e) {
+        return prop.toString()
+    }
+}
+
+// Try to locate a javafx jmods directory on the system. This checks environment
+// variables, common download/install locations and performs a shallow search for
+// the presence of a javafx.controls.jmod file.
+def findJavaFxJmods() {
+    def env = System.getenv()
+    if (env['JAVAFX_JMODS']) {
+        def p = file(env['JAVAFX_JMODS'])
+        if (p.exists()) return p.absolutePath
+    }
+    if (env['JAVAFX_HOME']) {
+        def p = file(env['JAVAFX_HOME'])
+        if (p.exists()) return p.absolutePath
+    }
+
+    def userHome = System.getProperty('user.home')
+    def candidates = []
+    // Safely resolve javafxVersion if available. Avoid throwing if variable missing.
+    def jfxVer = null
+    try {
+        jfxVer = javafxVersion
+    } catch (e) {
+        if (project.hasProperty('javafxVersion')) {
+            jfxVer = project.property('javafxVersion') as String
+        }
+    }
+    if (jfxVer) {
+        candidates << "${userHome}/Downloads/javafx-jmods-${jfxVer}"
+        candidates << "C:/Program Files/Java/javafx-jmods-${jfxVer}"
+        candidates << "C:/Program Files/javafx-jmods-${jfxVer}"
+    }
+    candidates << "${project.rootDir}/javafx-jmods"
+    candidates << "${project.rootDir}/jmods/javafx"
+
+    for (c in candidates) {
+        def f = file(c)
+        if (f.exists()) {
+            logger.lifecycle('Found javafx jmods at candidate location: ' + f.path)
+            return f.absolutePath
+        }
+    }
+
+    // Shallow recursive search for a file named javafx.controls.jmod under some roots
+    def roots = [project.rootDir, file(userHome)]
+    def localOsName = (System.getProperty('os.name') ?: '').toLowerCase()
+    if (localOsName.contains('win')) {
+        roots << file('C:/Program Files')
+    } else {
+        roots << file('/opt')
+        roots << file('/usr/lib')
+    }
+
+    for (root in roots) {
+        if (!root.exists()) continue
+        def found = null
+        root.eachFileRecurse { f ->
+            if (found) return
+            if (f.isFile() && f.name == 'javafx.controls.jmod') {
+                found = f.parentFile
+            }
+        }
+        if (found) {
+            logger.lifecycle('Auto-discovered javafx jmods at: ' + found.path)
+            return found.absolutePath
+        }
+    }
+
+    return null
+}
+
+// Task: package an app-image using jpackage. Supports modular (--module) and
+// non-modular (--main-jar) modes. By default it depends on the regular jar task.
+// Make sure to set "JAVAFX_JMODS" env variable to jmods path of javafx
+// Download compatible java fx jmods here: https://gluonhq.com/products/javafx/
+tasks.register('packageAppImage', Exec) {
+    dependsOn 'jar'
+    group = 'distribution'
+    description = 'Package the application as an app-image (standalone folder with bundled runtime)'
+
+    doFirst {
+        // jar produced by Gradle
+        def jarFile = jar.archiveFile.get().asFile
+        def inputDir = jarFile.parentFile.absolutePath
+        def jarName = jarFile.name
+
+        def distDir = file('dist')
+        def appImageContainer = distDir.toPath().resolve('app-image').toFile()
+        if (appImageContainer.exists()) {
+            logger.lifecycle('Removing existing app-image container: ' + appImageContainer.path)
+            project.delete(appImageContainer)
+        }
+
+        def args = [] as List
+        // Prefer jpackage from JAVA_HOME
+        def javaHome = System.getenv('JAVA_HOME')
+        if (javaHome) {
+            args << file(javaHome).toPath().resolve('bin').resolve('jpackage').toFile().path
+        } else {
+            args << 'jpackage'
+        }
+
+    args << '--type' << 'app-image'
+    // Explicit application name -> controls folder and exe name (e.g., DungeonsBreath.exe)
+    args << '--name' << 'DungeonsBreath'
+
+        // Windows console: make console optional at build-time and add a secondary
+        // console launcher so users can choose at runtime by launching the Console exe.
+        def localOs = (System.getProperty('os.name') ?: '').toLowerCase()
+        def enableConsoleForMain = project.hasProperty('winConsole') && project.property('winConsole').toString() == 'true'
+        if (localOs.contains('win')) {
+            if (enableConsoleForMain) {
+                args << '--win-console'
+                logger.lifecycle('packageAppImage: enabling console for the main launcher (--win-console)')
+            } else {
+                logger.lifecycle('packageAppImage: building GUI main launcher (no console); a Console launcher will be added')
+            }
+        }
+
+        // If the project declares a module (modular project), use --module
+        def isModular = false
+        try {
+            if (application.mainModule != null && resolveApplicationValue(application.mainModule)) {
+                isModular = true
+            }
+        } catch (ignored) {}
+
+        if (isModular) {
+            def mainModuleValue = resolveApplicationValue(application.mainModule)
+            def mainClassValue = resolveApplicationValue(application.mainClass)
+            args << '--module' << (mainModuleValue + '/' + mainClassValue)
+            // jpackage will need access to the modular artifacts. Point module-path to build/libs
+            // Also include JavaFX jmods (if provided via -PjavafxJmods or JAVAFX_JMODS) so jpackage can resolve javafx.* modules
+            def modulePath = file('build/libs').absolutePath
+            def javafxJmodsForPkg = null
+            if (project.hasProperty('javafxJmods')) {
+                javafxJmodsForPkg = project.property('javafxJmods') as String
+                logger.lifecycle('packageAppImage: using project property javafxJmods = ' + javafxJmodsForPkg)
+            } else {
+                def discoveredForPkg = findJavaFxJmods()
+                if (discoveredForPkg) {
+                    javafxJmodsForPkg = discoveredForPkg
+                    logger.lifecycle('packageAppImage: auto-discovered javafx jmods = ' + javafxJmodsForPkg)
+                }
+            }
+            if (javafxJmodsForPkg) {
+                def jmodsDirForPkg = file(javafxJmodsForPkg)
+                if (jmodsDirForPkg.exists() && jmodsDirForPkg.isDirectory()) {
+                    modulePath = modulePath + File.pathSeparator + jmodsDirForPkg.absolutePath
+                    logger.lifecycle('packageAppImage: added JavaFX jmods to --module-path: ' + jmodsDirForPkg.absolutePath)
+                } else {
+                    logger.lifecycle('packageAppImage: configured javafxJmods path does not exist or is not a directory: ' + jmodsDirForPkg.absolutePath)
+                }
+            } else {
+                logger.lifecycle('packageAppImage: no JavaFX jmods found; jpackage may fail to resolve javafx modules')
+            }
+            args << '--module-path' << modulePath
+            // On Windows, add an extra launcher that opens a console window for debugging
+            if (localOs.contains('win')) {
+                def tmpDir = file('build/tmp/jpackage')
+                tmpDir.mkdirs()
+                def consoleLauncherProps = new File(tmpDir, 'console-launcher.properties')
+                def propsText = new StringBuilder()
+                propsText.append('module=')
+                        .append(mainModuleValue)
+                        .append('/')
+                        .append(mainClassValue)
+                        .append(System.lineSeparator())
+                        .append('win-console=true')
+                        .append(System.lineSeparator())
+                def iconFile = file('resources/icon.ico')
+                if (iconFile.exists()) {
+                    propsText.append('icon=')
+                            .append(iconFile.path)
+                            .append(System.lineSeparator())
+                }
+                consoleLauncherProps.text = propsText.toString()
+                args << '--add-launcher' << ('DungeonsBreathConsole=' + consoleLauncherProps.path)
+                logger.lifecycle('packageAppImage: added secondary console launcher: DungeonsBreathConsole')
+            }
+        } else {
+            args << '--input' << inputDir
+            args << '--main-jar' << jarName
+            def mainClassValue = resolveApplicationValue(application.mainClass)
+            args << '--main-class' << mainClassValue
+            // On Windows, add an extra launcher that opens a console window for debugging
+            if (localOs.contains('win')) {
+                def tmpDir = file('build/tmp/jpackage')
+                tmpDir.mkdirs()
+                def consoleLauncherProps = new File(tmpDir, 'console-launcher.properties')
+                def propsText = new StringBuilder()
+                propsText.append('main-jar=')
+                        .append(jarName)
+                        .append(System.lineSeparator())
+                        .append('main-class=')
+                        .append(mainClassValue)
+                        .append(System.lineSeparator())
+                        .append('win-console=true')
+                        .append(System.lineSeparator())
+                def iconFile = file('resources/icon.ico')
+                if (iconFile.exists()) {
+                    propsText.append('icon=')
+                            .append(iconFile.path)
+                            .append(System.lineSeparator())
+                }
+                consoleLauncherProps.text = propsText.toString()
+                args << '--add-launcher' << ('DungeonsBreathConsole=' + consoleLauncherProps.path)
+                logger.lifecycle('packageAppImage: added secondary console launcher: DungeonsBreathConsole')
+            }
+        }
+
+        def iconFile = file('resources/icon.ico')
+        if (iconFile.exists()) { args << '--icon' << iconFile.path }
+
+        if (project.version && project.version.toString() != 'unspecified') {
+            args << '--app-version' << project.version
+        } else {
+            logger.lifecycle('Project version is unspecified; skipping --app-version for jpackage')
+        }
+        args << '--dest' << appImageContainer.path
+
+        logger.lifecycle('Running jpackage (app-image) with args: ' + args.join(' '))
+        commandLine args
+    }
+
+    doLast {
+        def appImageRoot = file('dist').toPath().resolve('app-image').toFile()
+        if (!appImageRoot.exists()) {
+            logger.lifecycle('No app-image produced under: ' + appImageRoot.path)
+            return
+        }
+        def generated = appImageRoot.listFiles()?.find { it.isDirectory() }
+        if (generated == null) {
+            logger.lifecycle('No generated app-image directory found inside: ' + appImageRoot.path)
+            return
+        }
+        def zipName = generated.name + '.zip'
+        def zipFile = file('dist').toPath().resolve(zipName).toFile()
+        logger.lifecycle('Creating zip of app-image: ' + generated.path + ' -> ' + zipFile.path)
+        ant.zip(destfile: zipFile.path, basedir: generated.path)
+        logger.lifecycle('Created app-image zip: ' + zipFile.path)
+    }
+}
+
+// Windows-specific packaging using jpackage to create an exe/msi
+tasks.register('packageWindows', Exec) {
+    dependsOn 'jar'
+    group = 'distribution'
+    description = 'Package the application as a native Windows executable using jpackage'
+
+    doFirst {
+        def jarFile = jar.archiveFile.get().asFile
+        def inputDir = jarFile.parentFile.absolutePath
+        def jarName = jarFile.name
+
+        def args = [] as List
+        args << 'jpackage'
+        args << '--type' << 'exe'
+        args << '--input' << inputDir
+        args << '--name' << project.name
+        args << '--main-jar' << jarName
+        def mainClassValue = resolveApplicationValue(application.mainClass)
+        args << '--main-class' << mainClassValue
+
+        def iconFile = file('resources/icon.ico')
+        if (iconFile.exists()) { args << '--icon' << iconFile.path }
+
+        if (project.version && project.version.toString() != 'unspecified') {
+            args << '--app-version' << project.version
+        } else {
+            logger.lifecycle('Project version is unspecified; skipping --app-version for jpackage')
+        }
+        args << '--dest' << 'installer'
+
+        // Windows UX options
+        args << '--win-shortcut'
+        args << '--win-menu'
+        args << '--win-dir-chooser'
+        args << '--win-per-user-install'
+        args << '--vendor' << project.group
+
+        // Prefer jpackage from JAVA_HOME if available
+        def javaHome = System.getenv('JAVA_HOME')
+        if (javaHome) {
+            def jpackagePath = file(javaHome).toPath().resolve('bin').resolve('jpackage').toFile().path
+            args[0] = jpackagePath
+        }
+
+        logger.lifecycle('Running jpackage with args: ' + args.join(' '))
+        commandLine args
+    }
+}
+
+// Create a minimized runtime image with jlink. Adjust modules as needed for your app.
+// You can disable jlink by passing -PuseJlink=false to Gradle.
+// To include JavaFX jmods, pass -PjavafxJmods=/path/to/javafx-jmods
+tasks.register('createRuntimeImage', Exec) {
+    group = 'distribution'
+    description = 'Create a runtime image using jlink for smaller app bundles'
+
+    doFirst {
+        def javaHomeEnv = System.getenv('JAVA_HOME')
+        def jlinkPath = null
+
+        if (javaHomeEnv) {
+            def candidate = file(javaHomeEnv).toPath().resolve('bin').resolve('jlink').toFile()
+            if (candidate.exists()) { jlinkPath = candidate.path }
+            else {
+                candidate = file(javaHomeEnv).toPath().resolve('bin').resolve('jlink.exe').toFile()
+                if (candidate.exists()) { jlinkPath = candidate.path }
+            }
+        }
+
+        if (!jlinkPath) {
+            def pathEnv = System.getenv('PATH')
+            if (pathEnv) {
+                pathEnv.split(File.pathSeparator).each { p ->
+                    if (!jlinkPath) {
+                        def f = new File(p, 'jlink')
+                        def fe = new File(p, 'jlink.exe')
+                        if (f.exists()) { jlinkPath = f.path }
+                        if (fe.exists()) { jlinkPath = fe.path }
+                    }
+                }
+            }
+        }
+
+        if (!jlinkPath) {
+            throw new GradleException("jlink not found. Set JAVA_HOME to a JDK (9+) that contains jlink and a 'jmods' folder, or install a JDK and add its bin to PATH.")
+        }
+
+        logger.lifecycle("Using jlink executable: " + jlinkPath)
+
+        def jmodsDir = null
+        if (javaHomeEnv) {
+            def jm = file(javaHomeEnv).toPath().resolve('jmods').toFile()
+            if (jm.exists()) { jmodsDir = jm.path }
+        }
+        if (!jmodsDir) {
+            def jlinkParent = file(jlinkPath).toPath().getParent().getParent()
+            def jm = jlinkParent.resolve('jmods').toFile()
+            if (jm.exists()) { jmodsDir = jm.path }
+        }
+        if (!jmodsDir) {
+            throw new GradleException("jmods directory not found. A JDK installation with a 'jmods' folder is required by jlink.")
+        }
+
+        def outputDir = file('build/runtime')
+        if (outputDir.exists()) {
+            logger.lifecycle('Removing existing runtime directory: ' + outputDir.path)
+            project.delete(outputDir)
+        }
+        def output = outputDir.absolutePath
+        // modules: include basic desktop modules; add javafx modules if javafxJmods provided
+        def modulesList = ['java.base','java.desktop','java.logging']
+        def javafxJmodsProp = null
+        if (project.hasProperty('javafxJmods')) {
+            javafxJmodsProp = project.property('javafxJmods') as String
+            logger.lifecycle('Using javafxJmods provided by project property: ' + javafxJmodsProp)
+        } else {
+            // attempt auto-discovery
+            def discovered = findJavaFxJmods()
+            if (discovered) {
+                javafxJmodsProp = discovered
+                logger.lifecycle('Auto-discovered javafx jmods: ' + javafxJmodsProp)
+            } else {
+                logger.lifecycle('No javafx jmods auto-discovered; proceeding without javafx jmods')
+            }
+        }
+
+        if (javafxJmodsProp) {
+            def jmodsCheckDir = file(javafxJmodsProp)
+            logger.lifecycle('Verifying javafx jmods directory: ' + jmodsCheckDir.absolutePath)
+            if (!jmodsCheckDir.exists() || !jmodsCheckDir.isDirectory()) {
+                throw new GradleException("Configured javafxJmods path does not exist or is not a directory: ${jmodsCheckDir}")
+            }
+            // show a short sample of jmod files for debugging
+            def sample = jmodsCheckDir.listFiles()?.findAll { it.name.toLowerCase().endsWith('.jmod') }?.take(10)
+            logger.lifecycle('Sample jmod files found: ' + (sample ? sample.collect { it.name }.join(', ') : '<none>'))
+            // Ensure common JavaFX modules are included when javafx is used
+            ['javafx.base','javafx.graphics','javafx.controls','javafx.fxml','javafx.media'].each { m ->
+                if (!modulesList.contains(m)) { modulesList << m }
+            }
+        }
+        def modules = modulesList.join(',')
+        // If javafxJmods provided, add them to module-path as well
+        def modulePath = file(jmodsDir).absolutePath
+        if (javafxJmodsProp) {
+            modulePath = modulePath + File.pathSeparator + file(javafxJmodsProp).absolutePath
+        }
+        // Validate that required modules exist as .jmod files on the module-path
+        def modulePathEntries = modulePath.split(File.pathSeparator).collect { file(it) }
+        def missing = []
+        modulesList.each { mod ->
+            def expected = mod + '.jmod'
+            def found = modulePathEntries.find { entry -> new File(entry, expected).exists() }
+            if (!found) {
+                missing << expected
+            }
+        }
+        if (!missing.isEmpty()) {
+            def msg = new StringBuilder()
+            msg.append('jlink validation failed — missing required jmod files for modules:\n')
+            missing.each { m -> msg.append('  - ').append(m).append('\n') }
+            msg.append('\nModule-path entries searched:\n')
+            modulePathEntries.each { e -> msg.append('  - ').append(e.absolutePath).append('\n') }
+            msg.append('\nSuggestions:\n')
+            msg.append('  * Ensure the JavaFX jmods are present and point to the jmods folder with -PjavafxJmods=path_to_javafx_jmods\n')
+            msg.append('  * Use -PuseJlink=false to skip creating a runtime image and package without jlink\n')
+            msg.append('  * Download JavaFX jmods for your JavaFX version (e.g., from Gluon) and place them in a known location\n')
+            throw new GradleException(msg.toString())
+        }
+        modulePath = '"' + modulePath + '"'
+        def args = [jlinkPath, '--module-path', modulePath, '--add-modules', modules, '--output', output, '--compress', '2', '--no-header-files', '--no-man-pages']
+        logger.lifecycle('Running jlink: ' + args.join(' '))
+        commandLine args
+    }
+}
+
+// Make packageAppImage depend on runtime image by default. If you don't want jlink,
+// run packageAppImage directly; createRuntimeImage will throw if jmods not available.
+tasks.named('packageAppImage') {
+    // Allow disabling jlink/runtime image creation with -PuseJlink=false
+    if (!(project.hasProperty('useJlink') && project.property('useJlink').toString() == 'false')) {
+        dependsOn 'createRuntimeImage'
+        doFirst {
+            def runtimeDir = file('build/runtime')
+            if (runtimeDir.exists()) {
+                // insert --runtime-image before --dest
+                def destIndex = null
+                for (int i = 0; i < commandLine.size(); i++) {
+                    if (commandLine.get(i) == '--dest') { destIndex = i; break }
+                }
+                if (destIndex != null) {
+                    def argsList = new ArrayList(commandLine)
+                    argsList.add(destIndex, runtimeDir.path)
+                    argsList.add(destIndex, '--runtime-image')
+                    commandLine = argsList
+                    logger.lifecycle('Added --runtime-image ' + runtimeDir.path + ' to jpackage args')
+                }
+            }
+        }
+    } else {
+        logger.lifecycle('useJlink=false detected; packageAppImage will not depend on createRuntimeImage')
+    }
+}
+
+

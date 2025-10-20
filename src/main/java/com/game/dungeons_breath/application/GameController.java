@@ -11,6 +11,12 @@ import com.game.dungeons_breath.models.*;
 import com.game.dungeons_breath.services.ImageLoader;
 import com.game.dungeons_breath.services.KeyMouseInputService;
 import com.game.dungeons_breath.services.SoundService;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.File;
+import java.io.PrintWriter;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 
 public class GameController {
 
@@ -40,6 +46,34 @@ public class GameController {
         listeners = new ArrayList<>();
         keyMouseInputService = new KeyMouseInputService();
         soundService = new SoundService();
+        initFileLogger();
+    }
+
+    // Simple file logger to help debug packaged app behavior
+    private PrintWriter fileLog;
+
+    private void initFileLogger() {
+        try {
+            String userHome = System.getProperty("user.home");
+            FileWriter fw = new FileWriter(userHome + File.separator + "dungeons-breath.log", true);
+            fileLog = new PrintWriter(fw, true);
+            logf("GameController constructed");
+        } catch (IOException e) {
+            // ignore logging failures
+            fileLog = null;
+        }
+    }
+
+    private void logf(String msg, Object... args) {
+        if (fileLog == null)
+            return;
+        String ts = LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+        try {
+            fileLog.printf("%s - %s\n", ts, String.format(msg, args));
+        } catch (Exception ex) {
+            // fallback
+            fileLog.println(ts + " - " + msg);
+        }
     }
 
     public void dispose() {
@@ -48,6 +82,9 @@ public class GameController {
         if (soundService != null)
             soundService.dispose();
         soundService = null;
+        logf("GameController disposed");
+        if (fileLog != null)
+            fileLog.close();
     }
 
     public void startGame() {
@@ -56,6 +93,7 @@ public class GameController {
             gameThread = new Thread() {
                 @Override
                 public void run() {
+                    logf("gameThread.run() starting");
                     while (running) {
                         try {
 
@@ -66,16 +104,20 @@ public class GameController {
                             }
                             Thread.sleep(stepSize);
                         } catch (InterruptedException e) {
+                            logf("gameThread interrupted: %s", e.toString());
                             throw new RuntimeException(e);
                         }
                     }
+                    logf("gameThread.run() exiting");
                     super.run();
                 }
             };
             running = true;
+            logf("Starting gameThread");
             gameThread.start();
         }
         state = GameState.STARTING;
+        logf("Game state -> STARTING");
         soundService.playContinousSound(backgroundSound, true, true);
     }
 
